@@ -79,8 +79,9 @@ else:
     model = "offline"
     problem = dataset.labse_problem()
     if "No module named 'sentence_transformers'" in problem:
-        st.sidebar.warning("LaBSE is not installed, so the much weaker offline scorer is used. Install it in a "
-                           "command window, then restart the app:\n\n`python -m pip install torch sentence-transformers`")
+        st.sidebar.warning("LaBSE is not installed, so the much weaker offline scorer is used. This is expected "
+                           "on the free online version; for better alignment run the app on a computer that has "
+                           "it:\n\n`python -m pip install -r requirements-full.txt`")
     else:
         st.sidebar.warning("LaBSE is installed but cannot start, so the much weaker offline scorer is used. "
                            "Usually a version clash; fix it in a command window, then restart the app:\n\n"
