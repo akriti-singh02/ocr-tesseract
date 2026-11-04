@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
 
 import dataset
+import extract_tables_images as assets
 import pdf_text
 
 st.set_page_config(page_title="PDF to dataset", page_icon="📄", layout="wide")
@@ -33,6 +34,39 @@ def read_pdf(data, lang, pages, ocr_mode, dpi, can_ocr, progress=None):
             store.pop(next(iter(store)))
         store[key] = pdf_text.extract(data, [lang], pages, ocr_mode, dpi, can_ocr, progress=progress)
     return store[key]
+
+
+@st.cache_resource
+def docling_converter(codes, ocr):
+    return assets.build_converter(codes.split("+"), ocr=ocr)
+
+
+def find_assets(data, name, lang, pages, can_ocr):
+    """Tables and pictures of one PDF (Docling), kept for this browser session like read_pdf."""
+    store = st.session_state.setdefault("asset_cache", {})
+    key = (hashlib.sha1(data).hexdigest(), lang, tuple(sorted(pages)), can_ocr)
+    if key not in store:
+        if len(store) >= 10:
+            store.pop(next(iter(store)))
+        codes = pdf_text.tesseract_codes([lang])
+        store[key] = assets.find(data, docling_converter(codes, can_ocr), name, set(pages))
+    return store[key]
+
+
+def bundle(out):
+    """One zip: Excel workbook, CSV files, text, tables.md and images.zip."""
+    buf = io.BytesIO()
+    name = out["name"]
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(f"{name}/{name}.xlsx",
+                   dataset.to_xlsx(name, out["kind"], out["documents"], out["tables"], out["settings"]))
+        with zipfile.ZipFile(io.BytesIO(dataset.to_zip(name, out["documents"], out["tables"], out["texts"]))) as csvs:
+            for item in csvs.infolist():
+                z.writestr(item, csvs.read(item))
+        if out.get("pdf_tables") is not None:
+            z.writestr(f"{name}/tables.md", assets.tables_markdown(out["pdf_tables"], f"{name}: tables"))
+            z.writestr(f"{name}/images.zip", assets.images_zip(out["pdf_images"]))
+    return buf.getvalue()
 
 
 @st.cache_resource
@@ -102,6 +136,18 @@ page_anchor = st.sidebar.radio(
          "counts differ, the whole documents are aligned as one piece.")
 match = {"Automatic (recommended)": "auto", "Box by box": "box", "Page by page": "page",
          "Whole document": "document"}[page_anchor]
+
+st.sidebar.subheader("Tables and pictures")
+if assets.available():
+    want_assets = st.sidebar.checkbox(
+        "Save tables and pictures", value=True,
+        help="Docling finds every table (saved as tables.md) and every picture (saved as image_1.png, "
+             "image_2.png ... in images.zip) and puts them in the download zip. Adds about 5-20 seconds a "
+             "page; the first run downloads Docling's models (about 500 MB).")
+else:
+    want_assets = False
+    st.sidebar.caption("To also get tables (tables.md) and pictures (images.zip) in the download, install "
+                       "Docling and restart the app:\n\n`python -m pip install -r requirements-docling.txt`")
 
 exe, packs = tesseract_status()
 st.sidebar.markdown("---")
@@ -198,6 +244,20 @@ if st.button("Build dataset", type="primary", disabled=bool(problems)):
                 st.error(f"Document {k} ({f.name}) could not be read: {e}")
                 st.stop()
             docs.append({"name": f.name, "language": d["language"], "pages": res})
+        pdf_tables = pdf_images = None
+        if want_assets:
+            pdf_tables, pdf_images = [], []
+            for k, (d, doc) in enumerate(zip(docs_in, docs), 1):
+                st.write(f"Document {k} ({doc['name']}): finding tables and pictures"
+                         + (" (the first run downloads Docling's models)..." if k == 1 else "..."))
+                try:
+                    t, im = find_assets(d["file"].getvalue(), doc["name"], d["language"],
+                                        [r["page"] for r in doc["pages"]], can_ocr)
+                except Exception as e:      # no internet for the models, damaged PDF ...
+                    st.warning(f"Tables and pictures of document {k} could not be read: {e}")
+                    continue
+                pdf_tables += [{**x, "source": f"D{k} {doc['name']}"} for x in t]
+                pdf_images += im
         if kind != "monolingual":
             st.write("Splitting into sentences and aligning" + (" (the first run downloads the model)..."
                                                                  if model != "offline" else "..."))
@@ -211,7 +271,8 @@ if st.button("Build dataset", type="primary", disabled=bool(problems)):
         status.update(label="Dataset ready", state="complete", expanded=False)
     st.session_state["out"] = {"name": name, "kind": kind, "documents": documents, "tables": tables,
                                "settings": settings, "texts": {f"D{k}_{Path(d['name']).stem}": pdf_text.to_txt(d["pages"])
-                                                               for k, d in enumerate(docs, 1)}}
+                                                               for k, d in enumerate(docs, 1)},
+                               "pdf_tables": pdf_tables, "pdf_images": pdf_images}
 
 # ------------------------------------------------------------------ results
 out = st.session_state.get("out")
@@ -227,17 +288,21 @@ if out:
     c[2].metric("Rows" if main == "Sentences" else ("Aligned rows" if main == "Multilingual" else "Pairs"), len(rows))
     c[3].metric("Need review", f"{flagged} ({flagged / max(1, len(rows)):.0%})")
 
-    d = st.columns(3)
-    d[0].download_button("⬇️ Excel workbook", dataset.to_xlsx(out["name"], out["kind"], documents, tables, out["settings"]),
-                         f"{out['name']}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    d = st.columns([1, 2])
+    d[0].download_button("⬇️ Download dataset (.zip)", bundle(out), f"{out['name']}.zip", "application/zip",
                          type="primary")
-    d[1].download_button("⬇️ CSV files + text (.zip)", dataset.to_zip(out["name"], documents, tables, out["texts"]),
-                         f"{out['name']}.zip", "application/zip")
-    with d[2]:
+    with d[1]:
+        inside = "Excel workbook, CSV files, text"
+        if out.get("pdf_tables") is not None:
+            inside += (f", tables.md ({len(out['pdf_tables'])} tables)"
+                       f" and images.zip ({len(out['pdf_images'])} pictures)")
+        st.caption(f"Inside: {inside}.")
         st.caption(" · ".join(f"{k}: {v}" for k, v in out["settings"].items()))
 
     only_review = st.checkbox("Show only rows that need review")
     tab_names = ["Documents"] + list(tables) + ["Extracted text"]
+    if out.get("pdf_tables") is not None:
+        tab_names += ["Tables and pictures"]
     tabs = st.tabs(tab_names)
     with tabs[0]:
         st.dataframe(pd.DataFrame(documents), hide_index=True, use_container_width=True)
@@ -254,7 +319,19 @@ if out:
                 df = df.style.apply(lambda r: ["background-color: #fff2cc" if r["needs_manual_review"] == "Yes"
                                                else "" for _ in r], axis=1)
             st.dataframe(df, hide_index=True, use_container_width=True, height=500)
-    with tabs[-1]:
+    with tabs[len(tables) + 1]:
         for doc_id, txt in out["texts"].items():
             with st.expander(doc_id):
                 st.text(txt[:20000] + ("\n... (download the .zip for the full text)" if len(txt) > 20000 else ""))
+    if out.get("pdf_tables") is not None:
+        with tabs[-1]:
+            if not out["pdf_tables"] and not out["pdf_images"]:
+                st.write("No tables or pictures found.")
+            for n, t in enumerate(out["pdf_tables"], 1):
+                st.markdown(f"**Table {n}** · {t['source']}, page {t['page']}")
+                st.markdown(t["markdown"])
+            if out["pdf_images"]:
+                st.markdown("**Pictures**")
+                st.image([im["image"] for im in out["pdf_images"]],
+                         caption=[f"image_{n}.png · page {im['page']}" for n, im in enumerate(out["pdf_images"], 1)],
+                         width=160)

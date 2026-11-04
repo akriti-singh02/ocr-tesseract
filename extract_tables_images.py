@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Pull the tables and pictures out of a PDF with Docling.
 
-For each PDF it writes, in page order:
-  <out>/<name>/tables/table_1.md, table_2.md ...   one Markdown table per table found
-  <out>/<name>/images/image_1.png, image_2.png ... every picture/figure found
-  <out>/<name>/<name>_images.zip                   the images folder, zipped
-  <out>/<name>/<name>_tables.zip                   the tables folder, zipped
+Used by the Streamlit app (app.py: tables.md and images.zip go into the download zip) and from
+the command line. For each PDF the command line writes, in page order:
+  <out>/<name>/tables.md                     every table, as Markdown, numbered Table 1, Table 2 ...
+  <out>/<name>/tables/table_1.md, ...        the same tables, one file each
+  <out>/<name>/images.zip                    image_1.png, image_2.png ... every picture/figure
 
 Docling finds tables and pictures with a layout model that looks at the rendered page, so it
 also works on PDFs like the Odia textbooks where every line of text is a small image and the
@@ -17,17 +17,28 @@ Examples:
   python extract_tables_images.py folder_of_pdfs --pages 1-5
   python extract_tables_images.py book.pdf --no-ocr     (PDF already has real text)
 
-Needs: pip install docling   (and Tesseract with the language packs, e.g. tesseract-ocr-ori)
+Needs: pip install -r requirements-docling.txt   (and Tesseract with the language packs)
+The first run downloads Docling's layout and table models from huggingface.co.
 """
 
 import argparse
 import hashlib
+import io
 import sys
 import zipfile
 from pathlib import Path
 
 
-def build_converter(langs, ocr=True, scale=2.0):
+def available():
+    """True when Docling is installed."""
+    try:
+        import docling  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def build_converter(langs=("ori", "eng"), ocr=True, scale=2.0):
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import (PdfPipelineOptions, TableFormerMode,
                                                     TesseractCliOcrOptions)
@@ -41,43 +52,30 @@ def build_converter(langs, ocr=True, scale=2.0):
     opts.images_scale = scale  # 2.0 = 144 dpi crops
     opts.do_ocr = ocr
     if ocr:
-        opts.ocr_options = TesseractCliOcrOptions(lang=langs, force_full_page_ocr=True)
+        opts.ocr_options = TesseractCliOcrOptions(lang=list(langs), force_full_page_ocr=True)
     return DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)})
 
 
-def _page_of(item):
-    return item.prov[0].page_no if item.prov else 0
-
-
-def _zip_folder(folder, zip_path):
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in sorted(folder.iterdir(), key=lambda p: (len(p.name), p.name)):
-            z.write(f, f.name)
-
-
-def extract(pdf, out_dir, converter, page_range=None, min_size=40, keep_duplicates=False):
-    """Write table_N.md and image_N.png for one PDF. Returns (tables, images) counts."""
+def find(pdf, converter, name="document.pdf", pages=None, min_size=40, keep_duplicates=False):
+    """Tables and pictures of one PDF, in page order.
+    pdf: path or bytes. pages: set of page numbers (1-based) to keep, None = all.
+    Returns (tables, images): tables = [{"page", "markdown"}], images = [{"page", "image" (PIL)}]."""
+    from docling.datamodel.base_models import DocumentStream
     from docling_core.types.doc import PictureItem, TableItem
 
-    kwargs = {"page_range": page_range} if page_range else {}
-    doc = converter.convert(str(pdf), **kwargs).document
+    source = DocumentStream(name=name, stream=io.BytesIO(pdf)) if isinstance(pdf, bytes) else str(pdf)
+    kwargs = {"page_range": (min(pages), max(pages))} if pages else {}
+    doc = converter.convert(source, **kwargs).document
 
-    tables_dir, images_dir = out_dir / "tables", out_dir / "images"
-    for d in (tables_dir, images_dir):
-        d.mkdir(parents=True, exist_ok=True)
-        for old in d.iterdir():
-            old.unlink()
-
-    n_tab = n_img = 0
-    seen = set()
+    tables, images, seen = [], [], set()
     for item, _ in doc.iterate_items():  # reading order = page order
+        page = item.prov[0].page_no if getattr(item, "prov", None) else 0
+        if pages and page not in pages:
+            continue
         if isinstance(item, TableItem):
             md = item.export_to_markdown(doc=doc).strip()
-            if not md:
-                continue
-            n_tab += 1
-            (tables_dir / f"table_{n_tab}.md").write_text(
-                f"<!-- {pdf.name}, page {_page_of(item)} -->\n\n{md}\n", encoding="utf-8")
+            if md:
+                tables.append({"page": page, "markdown": md})
         elif isinstance(item, PictureItem):
             img = item.get_image(doc)
             if img is None or min(img.size) < min_size:
@@ -86,23 +84,57 @@ def extract(pdf, out_dir, converter, page_range=None, min_size=40, keep_duplicat
             if not keep_duplicates and key in seen:
                 continue  # same logo/icon repeated on every page
             seen.add(key)
-            n_img += 1
-            img.save(images_dir / f"image_{n_img}.png")
+            images.append({"page": page, "image": img})
+    return tables, images
 
-    _zip_folder(images_dir, out_dir / f"{pdf.stem}_images.zip")
-    _zip_folder(tables_dir, out_dir / f"{pdf.stem}_tables.zip")
-    return n_tab, n_img
+
+def tables_markdown(tables, title="Tables"):
+    """One Markdown file holding every table. tables: [{"page", "markdown", optional "source"}]."""
+    if not tables:
+        return f"# {title}\n\nNo tables found.\n"
+    parts = [f"# {title}\n"]
+    for n, t in enumerate(tables, 1):
+        where = f"{t['source']}, page {t['page']}" if t.get("source") else f"page {t['page']}"
+        parts.append(f"## Table {n}\n\n<!-- {where} -->\n\n{t['markdown']}\n")
+    return "\n".join(parts)
+
+
+def images_zip(images):
+    """Zip (bytes) with image_1.png, image_2.png ... in the given order."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for n, im in enumerate(images, 1):
+            png = io.BytesIO()
+            im["image"].save(png, format="PNG")
+            z.writestr(f"image_{n}.png", png.getvalue())
+    return buf.getvalue()
+
+
+def save(pdf, out_dir, converter, pages=None, keep_duplicates=False):
+    """Command-line output for one PDF. Returns (tables, images) counts."""
+    tables, images = find(pdf, converter, pdf.name, pages, keep_duplicates=keep_duplicates)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "tables.md").write_text(tables_markdown(tables, pdf.name), encoding="utf-8")
+    one_by_one = out_dir / "tables"
+    one_by_one.mkdir(exist_ok=True)
+    for old in one_by_one.glob("table_*.md"):
+        old.unlink()
+    for n, t in enumerate(tables, 1):
+        (one_by_one / f"table_{n}.md").write_text(f"<!-- {pdf.name}, page {t['page']} -->\n\n{t['markdown']}\n",
+                                                 encoding="utf-8")
+    (out_dir / "images.zip").write_bytes(images_zip(images))
+    return len(tables), len(images)
 
 
 def parse_range(spec):
     if not spec:
         return None
     a, _, b = spec.partition("-")
-    return (int(a), int(b or a))
+    return set(range(int(a), int(b or a) + 1))
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Save every table (Markdown) and picture (PNG + zip) from PDFs.")
+    ap = argparse.ArgumentParser(description="Save every table (Markdown) and picture (PNG in a zip) from PDFs.")
     ap.add_argument("input", help="a PDF file, or a folder of PDFs")
     ap.add_argument("-o", "--output", help="output folder (default: next to the PDF)")
     ap.add_argument("--lang", default="ori,eng", help="Tesseract language packs, comma separated (default ori,eng)")
@@ -127,7 +159,7 @@ def main():
     for pdf in pdfs:
         out = Path(a.output) / pdf.stem if a.output else pdf.with_suffix("")
         print(f"{pdf.name}: reading ...", flush=True)
-        n_tab, n_img = extract(pdf, out, converter, parse_range(a.pages), keep_duplicates=a.keep_duplicates)
+        n_tab, n_img = save(pdf, out, converter, parse_range(a.pages), a.keep_duplicates)
         print(f"{pdf.name}: {n_tab} tables, {n_img} images -> {out}")
 
 
