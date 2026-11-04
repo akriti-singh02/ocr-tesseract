@@ -1,0 +1,4 @@
+# Extra packages for extract_tables_images.py (tables -> Markdown, pictures -> PNG + zip).
+# pip install -r requirements-docling.txt
+# The first run downloads Docling's layout and table models from huggingface.co (about 500 MB).
+docling==2.146.0
